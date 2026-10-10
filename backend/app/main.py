@@ -2,10 +2,12 @@ from datetime import datetime, timezone
 from typing import Literal
 import re
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .ollama_service import OllamaError, analyze_with_ollama, is_ollama_enabled, ollama_model, ollama_status
+from .database import Document, KnowledgeChunk, Project, SessionLocal, init_db
+from .knowledge_service import chunk_text, extract_text, search_chunks
 
 load_dotenv()
 
@@ -17,6 +19,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
 
 class AnalyzeRequest(BaseModel):
     title: str = "Untitled meeting"
@@ -59,6 +65,29 @@ class MeetingAnalysis(BaseModel):
     transcript: str
     analysis_source: Literal["ollama", "fallback"] = "fallback"
     model: str | None = None
+
+class ProjectRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = None
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=2)
+    limit: int = Field(default=8, ge=1, le=20)
+
+class VerifyRequest(BaseModel):
+    decision: str = Field(min_length=3)
+
+class Evidence(BaseModel):
+    document_id: int
+    filename: str
+    chunk_id: str
+    content: str
+    score: float
+
+class VerificationResponse(BaseModel):
+    result: Literal["SUPPORTED", "CONTRADICTED", "INSUFFICIENT_EVIDENCE", "AMBIGUOUS"]
+    explanation: str
+    evidence: list[Evidence]
 
 
 def speaker_and_quote(line: str, index: int) -> Citation:
@@ -123,6 +152,75 @@ def health() -> dict[str, object]:
 @app.get("/api/ollama/status")
 def ollama_health() -> dict[str, object]:
     return ollama_status()
+
+@app.post("/api/projects")
+def create_project(request: ProjectRequest) -> dict[str, object]:
+    with SessionLocal() as session:
+        project = Project(name=request.name, description=request.description)
+        session.add(project)
+        try:
+            session.commit()
+        except Exception as error:
+            session.rollback()
+            raise HTTPException(status_code=409, detail="A project with this name already exists") from error
+        session.refresh(project)
+        return {"id": project.id, "name": project.name, "description": project.description, "created_at": project.created_at}
+
+@app.get("/api/projects")
+def list_projects() -> list[dict[str, object]]:
+    with SessionLocal() as session:
+        return [{"id": project.id, "name": project.name, "description": project.description, "created_at": project.created_at} for project in session.query(Project).order_by(Project.created_at.desc()).all()]
+
+@app.post("/api/projects/{project_id}/documents")
+async def upload_document(project_id: int, file: UploadFile = File(...)) -> dict[str, object]:
+    content = await file.read()
+    filename = file.filename or "uploaded-document"
+    try:
+        text = extract_text(filename, content)
+    except ValueError as error:
+        raise HTTPException(status_code=415, detail=str(error)) from error
+    with SessionLocal() as session:
+        if session.get(Project, project_id) is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        document_type = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
+        document = Document(project_id=project_id, filename=filename, document_type=document_type)
+        session.add(document)
+        session.flush()
+        chunks = chunk_text(text)
+        for index, chunk in enumerate(chunks, start=1):
+            session.add(KnowledgeChunk(project_id=project_id, document_id=document.id, chunk_id=f"doc-{document.id}-chunk-{index}", content=chunk))
+        session.commit()
+        return {"document_id": document.id, "project_id": project_id, "filename": filename, "document_type": document_type, "chunks_created": len(chunks)}
+
+@app.get("/api/projects/{project_id}/documents")
+def list_documents(project_id: int) -> list[dict[str, object]]:
+    with SessionLocal() as session:
+        if session.get(Project, project_id) is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return [{"id": document.id, "filename": document.filename, "document_type": document.document_type, "created_at": document.created_at} for document in session.query(Document).filter_by(project_id=project_id).order_by(Document.created_at.desc()).all()]
+
+@app.post("/api/projects/{project_id}/search")
+def search_project(project_id: int, request: SearchRequest) -> list[Evidence]:
+    with SessionLocal() as session:
+        if session.get(Project, project_id) is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        rows = session.query(KnowledgeChunk).filter(KnowledgeChunk.project_id == project_id).all()
+        matches = search_chunks([(chunk, chunk.content) for chunk in rows], request.query, request.limit)
+        return [Evidence(document_id=chunk.document_id, filename=session.get(Document, chunk.document_id).filename, chunk_id=chunk.chunk_id, content=content, score=round(score, 3)) for chunk, content, score in matches]
+
+@app.post("/api/projects/{project_id}/verify", response_model=VerificationResponse)
+def verify_decision(project_id: int, request: VerifyRequest) -> VerificationResponse:
+    evidence = search_project(project_id, SearchRequest(query=request.decision, limit=8))
+    if not evidence:
+        return VerificationResponse(result="INSUFFICIENT_EVIDENCE", explanation="No project knowledge matched this decision. The system cannot verify it yet.", evidence=[])
+    proposal_terms = set(re.findall(r"[\w-]+", request.decision.lower()))
+    contradiction_terms = {"not", "never", "remains", "instead", "reject", "avoid", "mustn't"}
+    contradictory = [item for item in evidence if contradiction_terms.intersection(set(re.findall(r"[\w-]+", item.content.lower()))) and proposal_terms.intersection(set(re.findall(r"[\w-]+", item.content.lower())))]
+    if contradictory:
+        return VerificationResponse(result="CONTRADICTED", explanation="Project evidence contains language that conflicts with the proposed decision. Review whether that evidence is current or superseded before acting.", evidence=evidence)
+    if len(evidence) == 1 and evidence[0].score < 0.4:
+        return VerificationResponse(result="AMBIGUOUS", explanation="A weakly matching source was found, but it is not sufficient to establish support.", evidence=evidence)
+    return VerificationResponse(result="SUPPORTED", explanation="The proposed decision matches project knowledge retrieved from the selected project.", evidence=evidence)
 
 @app.post("/api/meetings/analyze", response_model=MeetingAnalysis)
 def analyze_meeting(request: AnalyzeRequest) -> MeetingAnalysis:

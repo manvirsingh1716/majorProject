@@ -899,3 +899,17 @@ python3 -m uvicorn backend.app.main:app --reload --port 8000
 Or run `bash setup-local.sh` to automate the model pull and dependency installation.
 
 The API contract is isolated in `POST /api/meetings/analyze`. `GET /health` and `GET /api/ollama/status` report whether Ollama is reachable and which model is configured. Set `OLLAMA_MODEL` in `.env` to use another installed model. If Ollama is unavailable or returns invalid JSON, the API falls back to the deterministic analyzer and marks the response as `analysis_source: "fallback"`.
+
+## Phase 2 and 3 Local Knowledge
+
+Start PostgreSQL and Qdrant:
+
+```bash
+docker compose up -d postgres qdrant
+cp .env.example .env
+python3 -m uvicorn backend.app.main:app --reload --port 8000
+```
+
+The Projects view now supports creating the default knowledge project, uploading PDF/TXT/Markdown/DOCX files, extracting and chunking text into PostgreSQL, project-isolated keyword search, and decision verification with source chunks. The API routes are `POST /api/projects/{id}/documents`, `POST /api/projects/{id}/search`, and `POST /api/projects/{id}/verify`.
+
+Qdrant is provisioned in Docker as the next vector-storage boundary; the current search implementation is deterministic keyword retrieval so the project remains usable before embeddings are added.

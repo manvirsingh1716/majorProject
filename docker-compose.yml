@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: meeting2action-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: meeting2action
+      POSTGRES_USER: meeting2action
+      POSTGRES_PASSWORD: meeting2action
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    container_name: meeting2action-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  postgres_data:
+  qdrant_data:

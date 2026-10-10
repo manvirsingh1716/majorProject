@@ -14,6 +14,8 @@ if [ ! -f .env ]; then
   cp .env.example .env
 fi
 
+docker compose up -d postgres qdrant
+
 if python3 -m venv .venv >/dev/null 2>&1; then
   .venv/bin/python -m pip install -r backend/requirements.txt
 else
