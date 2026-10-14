@@ -6,7 +6,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .ollama_service import OllamaError, analyze_with_ollama, is_ollama_enabled, ollama_model, ollama_status
-from .database import Document, KnowledgeChunk, Project, SessionLocal, init_db
+from .database import ActionRecord, CalendarEvent, Document, KnowledgeChunk, Meeting, Project, SessionLocal, init_db
 from .knowledge_service import chunk_text, extract_text, search_chunks
 
 load_dotenv()
@@ -28,6 +28,8 @@ class AnalyzeRequest(BaseModel):
     title: str = "Untitled meeting"
     project: str = "Payment Platform"
     transcript: str = Field(min_length=20)
+    scheduled_at: str | None = None
+    attendees: list[str] = []
 
 class Citation(BaseModel):
     segment_id: str
@@ -65,6 +67,8 @@ class MeetingAnalysis(BaseModel):
     transcript: str
     analysis_source: Literal["ollama", "fallback"] = "fallback"
     model: str | None = None
+    scheduled_at: str | None = None
+    attendees: list[str] = []
 
 class ProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -88,6 +92,31 @@ class VerificationResponse(BaseModel):
     result: Literal["SUPPORTED", "CONTRADICTED", "INSUFFICIENT_EVIDENCE", "AMBIGUOUS"]
     explanation: str
     evidence: list[Evidence]
+
+class ActionPatch(BaseModel):
+    owner: str | None = None
+    deadline: str | None = None
+    priority: Literal["HIGH", "MEDIUM", "LOW"] | None = None
+    status: Literal["OPEN", "IN_PROGRESS", "DONE"] | None = None
+
+class CalendarRequest(BaseModel):
+    starts_at: str | None = None
+
+def persist_analysis(result: MeetingAnalysis, request: AnalyzeRequest) -> MeetingAnalysis:
+    result = result.model_copy(update={"action_items": [item.model_copy(update={"id": f"{result.id}-{item.id}"}) for item in result.action_items], "scheduled_at": request.scheduled_at, "attendees": request.attendees})
+    with SessionLocal() as session:
+        meeting = Meeting(public_id=result.id, title=result.title, project=result.project, transcript=result.transcript, analysis=result.model_dump(), scheduled_at=request.scheduled_at, attendees=request.attendees)
+        session.add(meeting)
+        session.flush()
+        for item in result.action_items:
+            session.add(ActionRecord(public_id=item.id, meeting_id=meeting.id, title=item.title, description=item.description, owner=item.owner, deadline=item.deadline, priority=item.priority, status=item.status, citation=item.citation.model_dump()))
+        session.commit()
+    return result
+
+def stored_meeting(meeting: Meeting, actions: list[ActionRecord]) -> MeetingAnalysis:
+    data = dict(meeting.analysis)
+    data["action_items"] = [ActionItem(id=item.public_id, title=item.title, description=item.description, owner=item.owner, deadline=item.deadline, priority=item.priority, status=item.status, citation=Citation.model_validate(item.citation)).model_dump() for item in actions]
+    return MeetingAnalysis.model_validate(data)
 
 
 def speaker_and_quote(line: str, index: int) -> Citation:
@@ -227,7 +256,7 @@ def analyze_meeting(request: AnalyzeRequest) -> MeetingAnalysis:
     if is_ollama_enabled():
         try:
             generated = analyze_with_ollama(request.title, request.project, request.transcript)
-            return MeetingAnalysis.model_validate({
+            result = MeetingAnalysis.model_validate({
                 **generated,
                 "id": f"meeting-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
                 "title": request.title,
@@ -237,6 +266,38 @@ def analyze_meeting(request: AnalyzeRequest) -> MeetingAnalysis:
                 "analysis_source": "ollama",
                 "model": ollama_model(),
             })
+            return persist_analysis(result, request)
         except (OllamaError, ValueError):
             pass
-    return analyze_transcript(request)
+    return persist_analysis(analyze_transcript(request), request)
+
+@app.get("/api/meetings", response_model=list[MeetingAnalysis])
+def list_meetings() -> list[MeetingAnalysis]:
+    with SessionLocal() as session:
+        meetings = session.query(Meeting).order_by(Meeting.created_at.desc()).all()
+        return [stored_meeting(meeting, session.query(ActionRecord).filter_by(meeting_id=meeting.id).all()) for meeting in meetings]
+
+@app.patch("/api/actions/{action_id}", response_model=ActionItem)
+def update_action(action_id: str, patch: ActionPatch) -> ActionItem:
+    with SessionLocal() as session:
+        action = session.query(ActionRecord).filter_by(public_id=action_id).first()
+        if action is None:
+            raise HTTPException(status_code=404, detail="Action item not found")
+        for key, value in patch.model_dump(exclude_unset=True).items():
+            setattr(action, key, value)
+        session.commit()
+        return ActionItem(id=action.public_id, title=action.title, description=action.description, owner=action.owner, deadline=action.deadline, priority=action.priority, status=action.status, citation=Citation.model_validate(action.citation))
+
+@app.post("/api/actions/{action_id}/calendar", status_code=201)
+def schedule_action(action_id: str, request: CalendarRequest) -> dict[str, object]:
+    """MCP-compatible calendar boundary; replace the adapter with Google OAuth later."""
+    with SessionLocal() as session:
+        action = session.query(ActionRecord).filter_by(public_id=action_id).first()
+        if action is None:
+            raise HTTPException(status_code=404, detail="Action item not found")
+        event = session.query(CalendarEvent).filter_by(action_id=action.id).first()
+        if event is None:
+            event = CalendarEvent(action_id=action.id, event_id=f"mock-event-{action.public_id}", title=action.title, starts_at=request.starts_at or action.deadline)
+            session.add(event)
+            session.commit()
+        return {"provider": event.provider, "event_id": event.event_id, "title": event.title, "starts_at": event.starts_at, "status": event.status}

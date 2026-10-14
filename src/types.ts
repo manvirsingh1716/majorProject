@@ -40,4 +40,6 @@ export interface MeetingAnalysis {
   transcript: string
   analysis_source?: 'ollama' | 'fallback'
   model?: string | null
+  scheduled_at?: string
+  attendees?: string[]
 }
